@@ -1,0 +1,128 @@
+# Внешняя проверка доступности Clawd.
+#
+# Живёт в облаке GitHub, поэтому работает, даже когда оба компьютера выключены.
+# Пропала связь -> создаётся issue в этом репозитории и уходит сообщение
+# в Telegram ботом Clawd. Восстановилась -> issue закрывается, приходит "снова в сети".
+#
+# Секреты репозитория (Settings -> Secrets and variables -> Actions):
+#   HEALTH_URL          - полный адрес проверки, например https://<host>/health
+#   TELEGRAM_BOT_TOKEN  - токен бота Clawd
+#   TELEGRAM_CHAT_ID    - числовой id чата администратора
+#
+# Cron стоит на 10 минут: это минимум, который GitHub отпускает без сюрпризов.
+# Репозиторий должен быть публичным, иначе запусков по расписанию не хватит
+# на бесплатные 2000 минут в месяц.
+
+name: clawd-health
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: clawd-health
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_MARK: CLAWD-DOWN
+      HEALTH_URL: ${{ secrets.HEALTH_URL }}
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Проверить эндпоинт (3 попытки)
+        id: probe
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            code=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 25 \
+              "$HEALTH_URL" 2>/dev/null || echo 000)
+            echo "попытка $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$ok" != "1" ]; then
+            echo "--- ответ сервера ---"
+            head -c 400 /tmp/body 2>/dev/null || echo "тела ответа нет"
+          fi
+
+      - name: Уведомить и записать состояние
+        if: always()
+        env:
+          OK: ${{ steps.probe.outputs.ok }}
+        run: |
+          notify() {
+            if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+              echo "секреты Telegram не заданы, сообщение пропущено"
+              return 0
+            fi
+            curl -sS --max-time 25 -X POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true" \
+              > /dev/null || echo "Telegram не ответил"
+          }
+
+          open_issue=$(gh issue list --state open \
+            --search "in:title ${ISSUE_MARK}" \
+            --json number --jq '.[0].number // empty')
+
+          if [ "${OK}" = "1" ]; then
+            if [ -n "$open_issue" ]; then
+              notify "✅ Clawd снова в сети: ${HEALTH_URL}"
+              gh issue close "$open_issue" \
+                --comment "Автоматически: сервер снова отвечает 200."
+            else
+              echo "всё в порядке, не шумим"
+            fi
+            exit 0
+          fi
+
+          # Авария. Повторные сообщения не шлём: пока issue открыт, состояние
+          # уже известно, иначе при долгом падении придёт сотня сообщений.
+          if [ -n "$open_issue" ]; then
+            echo "авария уже зафиксирована в issue #${open_issue}"
+            exit 0
+          fi
+
+          body=$(head -c 400 /tmp/body 2>/dev/null || echo "нет ответа")
+          gh issue create \
+            --title "${ISSUE_MARK}: Clawd не отвечает" \
+            --body "$(printf 'Проверка: %s\nВремя: %s\nОтвет сервера: %s' \
+              "$HEALTH_URL" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$body")"
+          notify "❌ Clawd недоступен: ${HEALTH_URL}"
+
+      # Публичные репозитории теряют cron после 60 дней без активности,
+      # поэтому раз в сутки отмечаемся коммитом. Иначе мониторинг тихо умрёт.
+      - uses: actions/checkout@v4
+        if: always()
+
+      - name: Отметить активность репозитория
+        if: always()
+        run: |
+          today=$(date -u '+%Y-%m-%d')
+          if [ "$(head -c 10 last-run.txt 2>/dev/null)" = "$today" ]; then
+            echo "сегодня уже отмечались"
+            exit 0
+          fi
+          date -u '+%Y-%m-%d %H:%M UTC' > last-run.txt
+          git config user.name "clawd-monitor"
+          git config user.email "clawd-monitor@users.noreply.github.com"
+          git add last-run.txt
+          git commit -m "heartbeat ${today}"
+          git push || echo "push не удался: коммит активности пропущен"

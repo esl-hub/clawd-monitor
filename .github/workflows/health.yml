@@ -70,12 +70,15 @@ jobs:
               echo "секреты Telegram не заданы, сообщение пропущено"
               return 0
             fi
-            curl -sS --max-time 25 -X POST \
+            code=$(curl -sS --max-time 25 -o /tmp/tg -w '%{http_code}' -X POST \
               "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_CHAT}" \
               --data-urlencode "text=$1" \
-              --data-urlencode "disable_web_page_preview=true" \
-              > /dev/null || echo "Telegram не ответил"
+              --data-urlencode "disable_web_page_preview=true" 2>/dev/null || echo 000)
+            if [ "$code" != "200" ]; then
+              echo "Telegram ответил HTTP ${code}"
+              head -c 300 /tmp/tg 2>/dev/null || true
+            fi
           }
 
           open_issue=$(gh issue list --state open \
